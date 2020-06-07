@@ -46,7 +46,6 @@
 #include <lib/drivers/device/i2c.h>
 #include <lib/drivers/magnetometer/PX4Magnetometer.hpp>
 #include <lib/perf/perf_counter.h>
-#include <px4_platform_common/atomic.h>
 #include <px4_platform_common/px4_work_queue/ScheduledWorkItem.hpp>
 
 class MPU9250;
@@ -61,16 +60,13 @@ public:
 	~MPU9250_AK8963() override;
 
 	bool Init();
-	void Stop();
 	bool Reset();
 	void PrintInfo();
-
-	void set_temperature(float temperature) { _px4_mag.set_temperature(temperature); }
 
 private:
 
 	struct TransferBuffer {
-		//uint8_t ST1;
+		uint8_t ST1;
 		uint8_t HXL;
 		uint8_t HXH;
 		uint8_t HYL;
@@ -86,13 +82,11 @@ private:
 		uint8_t clear_bits{0};
 	};
 
-	int probe();
-
 	void Run() override;
 
 	bool Configure();
 
-	bool RegisterCheck(const register_config_t &reg_cfg, bool notify = false);
+	bool RegisterCheck(const register_config_t &reg_cfg);
 
 	uint8_t RegisterRead(AKM_AK8963::Register reg);
 	void RegisterWrite(AKM_AK8963::Register reg, uint8_t value);
@@ -105,31 +99,28 @@ private:
 	perf_counter_t _transfer_perf{perf_alloc(PC_ELAPSED, MODULE_NAME"_ak8963: transfer")};
 	perf_counter_t _bad_register_perf{perf_alloc(PC_COUNT, MODULE_NAME"_ak8963: bad register")};
 	perf_counter_t _bad_transfer_perf{perf_alloc(PC_COUNT, MODULE_NAME"_ak8963: bad transfer")};
-	perf_counter_t _duplicate_data_perf{perf_alloc(PC_COUNT, MODULE_NAME"_ak8963: duplicate data")};
 
 	hrt_abstime _reset_timestamp{0};
 	hrt_abstime _last_config_check_timestamp{0};
+	unsigned _consecutive_failures{0};
 
-	int16_t _last_measurement[3] {};
-
-	uint8_t _checked_register{0};
+	bool _sensitivity_adjustments_loaded{false};
+	float _sensitivity[3] {1.f, 1.f, 1.f};
 
 	enum class STATE : uint8_t {
 		RESET,
 		READ_WHO_AM_I,
 		WAIT_FOR_RESET,
+		READ_SENSITIVITY_ADJUSTMENTS,
 		CONFIGURE,
 		READ,
-		REQUEST_STOP,
-		STOPPED,
-	};
+	} _state{STATE::RESET};
 
-	px4::atomic<STATE> _state{STATE::RESET};
-
+	uint8_t _checked_register{0};
 	static constexpr uint8_t size_register_cfg{1};
 	register_config_t _register_cfg[size_register_cfg] {
 		// Register                       | Set bits, Clear bits
-		{ AKM_AK8963::Register::CNTL1,    AKM_AK8963::CNTL1_BIT::CONTINUOUS_MODE_2 | AKM_AK8963::CNTL1_BIT::BIT_16 },
+		{ AKM_AK8963::Register::CNTL1,    AKM_AK8963::CNTL1_BIT::CONTINUOUS_MODE_2 | AKM_AK8963::CNTL1_BIT::BIT_16, 0 },
 	};
 };
 

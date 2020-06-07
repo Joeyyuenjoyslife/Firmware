@@ -56,13 +56,9 @@ ICM20948_AK09916::ICM20948_AK09916(ICM20948 &icm20948, enum Rotation rotation) :
 
 ICM20948_AK09916::~ICM20948_AK09916()
 {
-	ScheduleClear();
-
 	perf_free(_transfer_perf);
 	perf_free(_bad_register_perf);
 	perf_free(_bad_transfer_perf);
-	perf_free(_duplicate_data_perf);
-	perf_free(_data_not_ready);
 }
 
 bool ICM20948_AK09916::Init()
@@ -83,9 +79,6 @@ void ICM20948_AK09916::PrintInfo()
 	perf_print_counter(_transfer_perf);
 	perf_print_counter(_bad_register_perf);
 	perf_print_counter(_bad_transfer_perf);
-	perf_print_counter(_duplicate_data_perf);
-	perf_print_counter(_data_not_ready);
-
 	_px4_mag.print_status();
 }
 
@@ -101,25 +94,23 @@ void ICM20948_AK09916::Run()
 		break;
 
 	case STATE::READ_WHO_AM_I:
-		_icm20948.I2CSlaveRegisterStartRead(I2C_ADDRESS_DEFAULT, (uint8_t)Register::WIA);
+		_icm20948.I2CSlaveRegisterStartRead(I2C_ADDRESS_DEFAULT, (uint8_t)Register::WIA1);
 		_state = STATE::WAIT_FOR_RESET;
 		ScheduleDelayed(10_ms);
 		break;
 
 	case STATE::WAIT_FOR_RESET: {
+			uint8_t WIA1 = 0;
+			_icm20948.I2CSlaveExternalSensorDataRead(&WIA1, 1);
 
-			uint8_t WIA = 0;
-			_icm20948.I2CSlaveExternalSensorDataRead(&WIA, 1);
-
-			if (WIA == WHOAMI) {
+			if (WIA1 == Company_ID) {
 				// if reset succeeded then configure
-				PX4_DEBUG("AK09916 reset successful, configuring");
 				_state = STATE::CONFIGURE;
 				ScheduleDelayed(10_ms);
 
 			} else {
 				// RESET not complete
-				if (hrt_elapsed_time(&_reset_timestamp) > 100_ms) {
+				if (hrt_elapsed_time(&_reset_timestamp) > 1000_ms) {
 					PX4_DEBUG("Reset failed, retrying");
 					_state = STATE::RESET;
 					ScheduleDelayed(100_ms);
@@ -133,64 +124,68 @@ void ICM20948_AK09916::Run()
 
 		break;
 
-	// TODO: read FUSE ROM (to get ASA corrections)
-
 	case STATE::CONFIGURE:
 		if (Configure()) {
 			// if configure succeeded then start reading
-			PX4_DEBUG("AK09916 configure successful, reading");
 			_icm20948.I2CSlaveExternalSensorDataEnable(I2C_ADDRESS_DEFAULT, (uint8_t)Register::ST1, sizeof(TransferBuffer));
 			_state = STATE::READ;
 			ScheduleOnInterval(20_ms, 20_ms); // 50 Hz
 
 		} else {
-			PX4_DEBUG("Configure failed, retrying");
-			// try again in 100 ms
-			ScheduleDelayed(100_ms);
+			// CONFIGURE not complete
+			if (hrt_elapsed_time(&_reset_timestamp) > 1000_ms) {
+				PX4_DEBUG("Configure failed, resetting");
+				_state = STATE::RESET;
+
+			} else {
+				PX4_DEBUG("Configure failed, retrying");
+			}
+
+			ScheduleDelayed(10_ms);
 		}
 
 		break;
 
 	case STATE::READ: {
 			perf_begin(_transfer_perf);
-
 			TransferBuffer buffer{};
 			const hrt_abstime timestamp_sample = hrt_absolute_time();
-			bool success = _icm20948.I2CSlaveExternalSensorDataRead((uint8_t *)&buffer, sizeof(TransferBuffer));
-
+			bool ret = _icm20948.I2CSlaveExternalSensorDataRead((uint8_t *)&buffer, sizeof(TransferBuffer));
 			perf_end(_transfer_perf);
 
-			if (success && !(buffer.ST2 & ST2_BIT::HOFL) && (buffer.ST1 & ST1_BIT::DRDY)) {
+			bool success = false;
+
+			if (ret && (buffer.ST1 & ST1_BIT::DRDY) && !(buffer.ST2 & ST2_BIT::HOFL)) {
 				// sensor's frame is +y forward (x), -x right, +z down
 				int16_t x = combine(buffer.HYH, buffer.HYL); // +Y
 				int16_t y = combine(buffer.HXH, buffer.HXL); // +X
 				y = (y == INT16_MIN) ? INT16_MAX : -y; // flip y
 				int16_t z = combine(buffer.HZH, buffer.HZL);
 
-				const bool all_zero = (x == 0 && y == 0 && z == 0);
-				const bool new_data = (_last_measurement[0] != x || _last_measurement[1] != y || _last_measurement[2] != z);
+				_px4_mag.update(timestamp_sample, x, y, z);
 
-				if (!new_data) {
-					perf_count(_duplicate_data_perf);
-				}
-
-				if (!all_zero && new_data) {
-					_px4_mag.update(timestamp_sample, x, y, z);
-
-					_last_measurement[0] = x;
-					_last_measurement[1] = y;
-					_last_measurement[2] = z;
-
-				} else {
-					success = false;
-				}
+				_consecutive_failures = 0;
+				success = true;
 
 			} else {
-				perf_count(_data_not_ready);
+				_consecutive_failures++;
 			}
 
-			if (!success) {
-				perf_count(_bad_transfer_perf);
+			if (!success || hrt_elapsed_time(&_last_config_check_timestamp) > 100_ms) {
+				// check configuration registers periodically or immediately following any failure
+				if (RegisterCheck(_register_cfg[_checked_register])) {
+					_last_config_check_timestamp = timestamp_sample;
+					_checked_register = (_checked_register + 1) % size_register_cfg;
+
+				} else {
+					// register check failed, force reset
+					perf_count(_bad_register_perf);
+					Reset();
+				}
+			}
+
+			if (_consecutive_failures > 10) {
+				Reset();
 			}
 		}
 
@@ -200,33 +195,19 @@ void ICM20948_AK09916::Run()
 
 bool ICM20948_AK09916::Configure()
 {
+	// first set and clear all configured register bits
+	for (const auto &reg_cfg : _register_cfg) {
+		RegisterWrite(reg_cfg.reg, reg_cfg.set_bits);
+	}
+
+	// now check that all are configured
 	bool success = true;
 
-	for (const auto &reg : _register_cfg) {
-		if (!RegisterCheck(reg)) {
+	for (const auto &reg_cfg : _register_cfg) {
+		if (!RegisterCheck(reg_cfg)) {
 			success = false;
 		}
 	}
-
-	// TODO: read ASA and set sensitivity
-
-	//const uint8_t ASAX = RegisterRead(Register::ASAX);
-	//const uint8_t ASAY = RegisterRead(Register::ASAY);
-	//const uint8_t ASAZ = RegisterRead(Register::ASAZ);
-
-	// float ak8963_ASA[3] {};
-
-	// for (int i = 0; i < 3; i++) {
-	// 	if (0 != response[i] && 0xff != response[i]) {
-	// 		ak8963_ASA[i] = ((float)(response[i] - 128) / 256.0f) + 1.0f;
-
-	// 	} else {
-	// 		return false;
-	// 	}
-	// }
-
-	// _px4_mag.set_sensitivity(ak8963_ASA[0], ak8963_ASA[1], ak8963_ASA[2]);
-
 
 	// in 16-bit sampling mode the mag resolution is 1.5 milli Gauss per bit */
 	_px4_mag.set_scale(1.5e-3f);
@@ -234,7 +215,7 @@ bool ICM20948_AK09916::Configure()
 	return success;
 }
 
-bool ICM20948_AK09916::RegisterCheck(const register_config_t &reg_cfg, bool notify)
+bool ICM20948_AK09916::RegisterCheck(const register_config_t &reg_cfg)
 {
 	bool success = true;
 
@@ -248,15 +229,6 @@ bool ICM20948_AK09916::RegisterCheck(const register_config_t &reg_cfg, bool noti
 	if (reg_cfg.clear_bits && ((reg_value & reg_cfg.clear_bits) != 0)) {
 		PX4_DEBUG("0x%02hhX: 0x%02hhX (0x%02hhX not cleared)", (uint8_t)reg_cfg.reg, reg_value, reg_cfg.clear_bits);
 		success = false;
-	}
-
-	if (!success) {
-		RegisterSetAndClearBits(reg_cfg.reg, reg_cfg.set_bits, reg_cfg.clear_bits);
-
-		if (notify) {
-			perf_count(_bad_register_perf);
-			_px4_mag.increase_error_count();
-		}
 	}
 
 	return success;
@@ -282,17 +254,11 @@ void ICM20948_AK09916::RegisterWrite(Register reg, uint8_t value)
 void ICM20948_AK09916::RegisterSetAndClearBits(Register reg, uint8_t setbits, uint8_t clearbits)
 {
 	const uint8_t orig_val = RegisterRead(reg);
-	uint8_t val = orig_val;
+	uint8_t val = (orig_val & ~clearbits) | setbits;
 
-	if (setbits) {
-		val |= setbits;
+	if (orig_val != val) {
+		RegisterWrite(reg, val);
 	}
-
-	if (clearbits) {
-		val &= ~clearbits;
-	}
-
-	RegisterWrite(reg, val);
 }
 
 } // namespace AKM_AK09916
